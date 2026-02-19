@@ -1,0 +1,40 @@
+
+services:
+  backend:
+    build: 
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+    environment:
+      - SKIP_OCR_TESTS=true # Avoid slow OCR model downloads on startup/test if we ran tests in docker
+    networks:
+      - app-network
+
+  frontend:
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend/src:/app/src
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+  # Redis (Optional mostly for this MVP unless session storage moved to Redis)
+  # redis:
+  #   image: redis:7-alpine
+  #   ports: ["6379:6379"]
+  #   networks:
+  #     - app-network
+
+networks:
+  app-network:
+    driver: bridge

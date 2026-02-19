@@ -1,0 +1,49 @@
+{
+    "metadata": {
+        "drawing_name": "Test Drawing",
+        "inspector": "John Doe",
+        "date": "2023-10-27",
+        "total_balloons": 5
+    },
+    "balloons": [
+        {
+            "balloon_no": 1,
+            "type": "linear",
+            "value": "10.5",
+            "unit": "mm",
+            "section": "drawing",
+            "view_id": "v1",
+            "position": [
+                100,
+                100
+            ]
+        },
+        {
+            "balloon_no": 2,
+            "type": "radius",
+            "value": "R5",
+            "unit": "",
+            "section": "drawing",
+            "view_id": "v1",
+            "position": [
+                200,
+                200
+            ]
+        }
+    ],
+    "notes": [
+        {
+            "balloon_no": 3,
+            "text": "Note 1"
+        }
+    ],
+    "bom": [
+        {
+            "balloon_no": 4,
+            "item_no": "1",
+            "description": "Screw",
+            "qty": "2",
+            "material": "Steel"
+        }
+    ]
+}
