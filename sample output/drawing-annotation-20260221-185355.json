@@ -1,0 +1,195 @@
+{
+  "metadata": {
+    "exportDate": "2026-02-21T13:23:59Z",
+    "drawingName": "Unnamed Drawing",
+    "scale": "1:1",
+    "canvasSize": {
+      "width": 660,
+      "height": 663
+    },
+    "imageSize": {
+      "width": 660,
+      "height": 663
+    }
+  },
+  "views": [
+    {
+      "id": 1,
+      "name": "c",
+      "type": "FRONT",
+      "balloonCount": 2
+    }
+  ],
+  "summary": {
+    "totalBalloons": 14,
+    "dimensions": 14,
+    "notes": 0,
+    "bomItems": 0,
+    "dimensionBreakdown": {
+      "linear": 5,
+      "angular": 0,
+      "radius": 0,
+      "circular": 9
+    }
+  },
+  "detectionFlow": {
+    "description": "Manual annotation system - Dimensions \u2192 Notes \u2192 BOM",
+    "flowDirection": "User-controlled placement with global sequential numbering"
+  },
+  "balloons": [
+    {
+      "id": "87583d15-e328-4cb5-a74a-90c9f9242c2b",
+      "number": 1,
+      "type": "dimension",
+      "x": 17.0,
+      "y": 12.0,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "linear",
+      "value": "",
+      "flowDirection": "clockwise"
+    },
+    {
+      "id": "30e65f6b-ec4b-4306-8fec-ae29cb08e627",
+      "number": 2,
+      "type": "dimension",
+      "x": 577.5,
+      "y": 91.5,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "linear",
+      "value": "",
+      "flowDirection": "clockwise"
+    },
+    {
+      "id": "ce6da5f0-693f-478f-9716-ca0a254da942",
+      "number": 3,
+      "type": "dimension",
+      "x": 621.5,
+      "y": 346.5,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "linear",
+      "value": "",
+      "flowDirection": "clockwise"
+    },
+    {
+      "id": "1027a948-0176-4f73-95d8-467b22c0000c",
+      "number": 4,
+      "type": "dimension",
+      "x": 281.0,
+      "y": 426.5,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "linear",
+      "value": "",
+      "flowDirection": "clockwise"
+    },
+    {
+      "id": "dcf881f7-b80f-4a93-967b-9823dc2eb7cc",
+      "number": 5,
+      "type": "dimension",
+      "x": 118.0,
+      "y": 636.5,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "linear",
+      "value": "",
+      "flowDirection": "clockwise"
+    },
+    {
+      "id": "e4640c28-077b-4f6c-9be2-d9281055215e",
+      "number": 6,
+      "type": "dimension",
+      "x": 71.41499999999999,
+      "y": 23.804999999999996,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "circular",
+      "value": "",
+      "flowDirection": "anticlockwise"
+    },
+    {
+      "id": "202a7f6f-3480-406d-bddc-92a52a41456c",
+      "number": 7,
+      "type": "dimension",
+      "x": 107.12249999999999,
+      "y": 76.70499999999998,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "circular",
+      "value": "",
+      "flowDirection": "anticlockwise"
+    },
+    {
+      "id": "f00c74a1-f4a6-4a23-9dd9-e68ee7f48c4b",
+      "number": 8,
+      "type": "dimension",
+      "x": 126.95999999999998,
+      "y": 80.67249999999999,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "circular",
+      "value": "",
+      "flowDirection": "anticlockwise"
+    },
+    {
+      "id": "83e75e2e-c15e-4463-a725-6c9552da5f31",
+      "number": 9,
+      "type": "dimension",
+      "x": 126.95999999999998,
+      "y": 121.66999999999999,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "circular",
+      "value": "",
+      "flowDirection": "anticlockwise"
+    },
+    {
+      "id": "723a8921-7736-491e-8cd9-27f494665238",
+      "number": 10,
+      "type": "dimension",
+      "x": 76.70499999999998,
+      "y": 136.21749999999997,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "circular",
+      "value": "",
+      "flowDirection": "anticlockwise"
+    },
+    {
+      "id": "b9bc4aa0-4e43-4fb1-bd38-f9a953e43552",
+      "number": 11,
+      "type": "dimension",
+      "x": 169.27999999999997,
+      "y": 144.15249999999997,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "circular",
+      "value": "",
+      "flowDirection": "anticlockwise"
+    },
+    {
+      "id": "e703fbe0-8b40-41bc-8531-129b1881ad71",
+      "number": 12,
+      "type": "dimension",
+      "x": 163.98999999999998,
+      "y": 181.18249999999998,
+      "viewId": "13631287-4a7e-4861-be51-5e53c3bb5cc8",
+      "dimensionType": "circular",
+      "value": "",
+      "flowDirection": "anticlockwise"
+    },
+    {
+      "id": "e3272030-4b3d-43e7-ba1b-80cfabd6ef80",
+      "number": 13,
+      "type": "dimension",
+      "x": 371.62249999999995,
+      "y": 17.192499999999995,
+      "viewId": 1,
+      "dimensionType": "circular",
+      "value": "",
+      "flowDirection": "anticlockwise"
+    },
+    {
+      "id": "4992d67f-e1d4-4f94-b82c-b85fe6d7986e",
+      "number": 14,
+      "type": "dimension",
+      "x": 359.7199999999999,
+      "y": 93.89749999999998,
+      "viewId": 1,
+      "dimensionType": "circular",
+      "value": "",
+      "flowDirection": "anticlockwise"
+    }
+  ]
+}

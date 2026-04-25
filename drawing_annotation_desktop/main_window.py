@@ -1,579 +1,754 @@
 """
-Main window: QGraphicsView + sidebar. All balloon operations and validation.
+main_window.py  —  EG Drawing Annotation Tool V2
+=================================================
+Main window: QGraphicsView + 10-page Wizard Sidebar.
+
+Key fixes vs previous version
+------------------------------
+* Removed all calls to NotImplementedError stubs (preprocess_image, segment_zones,
+  detect_dimensions, autodetect_run).  These are now routed through QThread workers
+  that call the v2 autodetect API (preprocess_drawing, detect_zones, detect_views,
+  detect_dimensions_in_view).
+* Added Page 3 (View Confirmation) to the stacked wizard — this matches Phase 3 in state.py.
+* Workers are stored as instance attributes (never GC'd while running).
+* closeEvent stops all in-flight workers cleanly.
+* Balloon display handles both new Balloon dataclass objects and legacy dicts.
 """
-import time
+
+import logging
 from pathlib import Path
 
+import numpy as np
+
 from PyQt6.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QSplitter,
-    QGraphicsView,
-    QScrollArea,
-    QGroupBox,
-    QPushButton,
-    QLabel,
-    QComboBox,
-    QLineEdit,
-    QTextEdit,
-    QMessageBox,
-    QFileDialog,
-    QFrame,
-    QRadioButton,
-    QGridLayout,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
+    QGraphicsView, QScrollArea, QGroupBox, QPushButton, QLabel,
+    QComboBox, QLineEdit, QTextEdit, QMessageBox, QFileDialog,
+    QFrame, QRadioButton, QGridLayout, QProgressBar, QStackedWidget,
+    QMenu, QInputDialog,
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPixmap, QWheelEvent, QPainter
+from PyQt6.QtCore import Qt, QPoint, pyqtSlot
+from PyQt6.QtGui import QPixmap, QWheelEvent, QPainter, QAction, QImage
 
-from state import state, generate_id, add_view, remove_view, renumber_all_balloons, get_balloon_count_for_view
+from state import (
+    state, generate_id, add_view, remove_view, renumber_all_balloons,
+    get_balloon_count_for_view, PHASES, Phase,
+    advance_phase, go_back_to_phase,
+)
 from scene import AnnotationScene
-from export_utils import export_to_file
-from autodetect import autodetect_run
+from export_utils import export_json, export_annotated_image, export_pdf_report, export_all
+from autodetect import qpixmap_to_cv
+from processing_workers import (
+    PreprocessingWorker,
+    ViewDetectionWorker,
+    DimensionExtractionWorker,
+)
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _gray_ndarray_to_pixmap(gray: np.ndarray) -> QPixmap:
+    """Convert a grayscale numpy array → QPixmap.  Must be called from the main thread."""
+    h, w = gray.shape
+    gray_c = np.ascontiguousarray(gray)
+    qimg = QImage(gray_c.data, w, h, w, QImage.Format.Format_Grayscale8).copy()
+    return QPixmap.fromImage(qimg)
 
 
-MAX_IMAGE_WIDTH = 900
+def _balloon_value(b) -> str:
+    """Return a display string regardless of Balloon dataclass or dict."""
+    from state import Balloon as BDC
+    if isinstance(b, BDC):
+        v = b.value or ""
+        if b.tolerance:
+            v += f" {b.tolerance}"
+        return v
+    return str(b.get("value", b.get("text", b.get("description", "—"))))
 
+
+def _balloon_number(b) -> int:
+    from state import Balloon as BDC
+    if isinstance(b, BDC):
+        return b.sequence_number
+    return b.get("number", 0)
+
+
+def _balloon_id(b):
+    from state import Balloon as BDC
+    if isinstance(b, BDC):
+        return b.balloon_id
+    return b.get("id")
+
+
+def _balloon_xy(b):
+    from state import Balloon as BDC
+    if isinstance(b, BDC):
+        return b.position_image
+    return b.get("x", 0), b.get("y", 0)
+
+
+# ---------------------------------------------------------------------------
+# Custom QGraphicsView (wheel zoom)
+# ---------------------------------------------------------------------------
 
 class DrawingGraphicsView(QGraphicsView):
-    """Graphics view with wheel zoom."""
-    def wheelEvent(self, event: QWheelEvent):
-        if event.angleDelta().y() > 0:
-            self.scale(1.15, 1.15)
-        else:
-            self.scale(1.0 / 1.15, 1.0 / 1.15)
+    """Graphics view with smooth wheel zoom."""
 
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
+        self.scale(factor, factor)
+
+
+# ---------------------------------------------------------------------------
+# Main Window
+# ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Engineering Drawing Annotation Tool")
-        self.setMinimumSize(1000, 700)
-        self.resize(1200, 800)
 
-        # Scene and view (NoDrag so left-click places balloons)
+    # ------------------------------------------------------------------ init
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("EG Drawing Annotation Tool V2")
+        self.setMinimumSize(1240, 820)
+
+        # Worker references — MUST be kept alive while threads run
+        self._preproc_worker: PreprocessingWorker | None = None
+        self._view_worker:    ViewDetectionWorker | None = None
+        self._dim_worker:     DimensionExtractionWorker | None = None
+
+        # Scene / view
         self.scene = AnnotationScene()
+        self.scene.balloon_context_callback = self._show_balloon_context_menu
         self.view = DrawingGraphicsView(self.scene)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.view.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.view.setMinimumWidth(400)
 
-        # Sidebar
-        sidebar = QWidget()
-        sidebar.setMaximumWidth(380)
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(8, 8, 8, 8)
+        # Layout
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
 
-        # Mode
-        mode_group = QGroupBox("Annotation mode")
-        mode_layout = QVBoxLayout(mode_group)
-        self.mode_dim = QRadioButton("Dimension")
-        self.mode_note = QRadioButton("Note")
-        self.mode_bom = QRadioButton("BOM")
-        self.mode_dim.setChecked(True)
-        mode_layout.addWidget(self.mode_dim)
-        mode_layout.addWidget(self.mode_note)
-        mode_layout.addWidget(self.mode_bom)
-        self.mode_dim.toggled.connect(lambda c: c and self._set_mode("dimension"))
-        self.mode_note.toggled.connect(lambda c: c and self._set_mode("note"))
-        self.mode_bom.toggled.connect(lambda c: c and self._set_mode("bom"))
-        sidebar_layout.addWidget(mode_group)
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximum(len(PHASES) - 1)
+        self.progress_bar.setFormat("Phase %v of %m")
+        self.progress_bar.setStyleSheet(
+            "QProgressBar { border-radius: 4px; background: #e0e0e0; }"
+            "QProgressBar::chunk { background: #2980b9; border-radius: 4px; }"
+        )
+        main_layout.addWidget(self.progress_bar)
 
-        # Dimension controls
-        self.dim_group = QGroupBox("Dimension")
-        dim_layout = QGridLayout(self.dim_group)
-        dim_layout.addWidget(QLabel("Type:"), 0, 0)
-        self.dim_type = QComboBox()
-        self.dim_type.addItems(["linear", "angular", "radius", "circular"])
-        dim_layout.addWidget(self.dim_type, 0, 1)
-        dim_layout.addWidget(QLabel("Flow:"), 1, 0)
-        self.flow_dir = QComboBox()
-        self.flow_dir.addItems(["clockwise", "anticlockwise"])
-        dim_layout.addWidget(self.flow_dir, 1, 1)
-        dim_layout.addWidget(QLabel("Value (optional):"), 2, 0)
-        self.dim_value = QLineEdit()
-        self.dim_value.setPlaceholderText("50mm, 45°, R10, Ø20")
-        dim_layout.addWidget(self.dim_value, 2, 1)
-        sidebar_layout.addWidget(self.dim_group)
+        # Status label
+        self.status_label = QLabel("Ready — load a drawing to begin.")
+        self.status_label.setStyleSheet("color: #555; padding: 2px 6px;")
+        main_layout.addWidget(self.status_label)
 
-        # Note controls
-        self.note_group = QGroupBox("Note")
-        note_layout = QVBoxLayout(self.note_group)
-        self.note_text = QTextEdit()
-        self.note_text.setPlaceholderText("Enter note text (required)")
-        self.note_text.setMaximumHeight(80)
-        note_layout.addWidget(self.note_text)
-        sidebar_layout.addWidget(self.note_group)
-        self.note_group.setVisible(False)
-
-        # BOM controls
-        self.bom_group = QGroupBox("BOM")
-        bom_layout = QGridLayout(self.bom_group)
-        bom_layout.addWidget(QLabel("Item #:"), 0, 0)
-        self.bom_item = QLineEdit()
-        bom_layout.addWidget(self.bom_item, 0, 1)
-        bom_layout.addWidget(QLabel("Description:"), 1, 0)
-        self.bom_desc = QLineEdit()
-        bom_layout.addWidget(self.bom_desc, 1, 1)
-        bom_layout.addWidget(QLabel("Quantity:"), 2, 0)
-        self.bom_qty = QLineEdit()
-        bom_layout.addWidget(self.bom_qty, 2, 1)
-        bom_layout.addWidget(QLabel("Material (opt):"), 3, 0)
-        self.bom_material = QLineEdit()
-        bom_layout.addWidget(self.bom_material, 3, 1)
-        bom_layout.addWidget(QLabel("Notes (opt):"), 4, 0)
-        self.bom_notes = QLineEdit()
-        bom_layout.addWidget(self.bom_notes, 4, 1)
-        sidebar_layout.addWidget(self.bom_group)
-        self.bom_group.setVisible(False)
-
-        # Drawing meta
-        meta_group = QGroupBox("Drawing")
-        meta_layout = QGridLayout(meta_group)
-        meta_layout.addWidget(QLabel("Name:"), 0, 0)
-        self.drawing_name = QLineEdit()
-        self.drawing_name.textChanged.connect(lambda t: state["drawing_meta"].__setitem__("name", t))
-        meta_layout.addWidget(self.drawing_name, 0, 1)
-        meta_layout.addWidget(QLabel("Scale:"), 1, 0)
-        self.drawing_scale = QLineEdit()
-        self.drawing_scale.setText("1:1")
-        self.drawing_scale.textChanged.connect(lambda t: state["drawing_meta"].__setitem__("scale", t or "1:1"))
-        meta_layout.addWidget(self.drawing_scale, 1, 1)
-        sidebar_layout.addWidget(meta_group)
-
-        # Views
-        view_group = QGroupBox("Views")
-        view_layout = QVBoxLayout(view_group)
-        view_row = QHBoxLayout()
-        self.view_type = QComboBox()
-        self.view_type.addItems(["TOP", "FRONT", "SIDE", "SECTION", "DETAIL", "ASSEMBLY"])
-        self.view_name = QLineEdit()
-        self.view_name.setPlaceholderText("View name")
-        self.add_view_btn = QPushButton("Add")
-        self.add_view_btn.clicked.connect(self._add_view)
-        view_row.addWidget(self.view_type)
-        view_row.addWidget(self.view_name)
-        view_row.addWidget(self.add_view_btn)
-        view_layout.addLayout(view_row)
-        self.view_list_widget = QWidget()
-        self.view_list_layout = QVBoxLayout(self.view_list_widget)
-        self.view_list_layout.setContentsMargins(0, 0, 0, 0)
-        view_layout.addWidget(self.view_list_widget)
-        sidebar_layout.addWidget(view_group)
-
-        # Summary
-        summary_group = QGroupBox("Summary")
-        summary_layout = QVBoxLayout(summary_group)
-        self.lbl_total = QLabel("Total: 0")
-        self.lbl_dims = QLabel("Dimensions: 0")
-        self.lbl_notes = QLabel("Notes: 0")
-        self.lbl_bom = QLabel("BOM: 0")
-        summary_layout.addWidget(self.lbl_total)
-        summary_layout.addWidget(self.lbl_dims)
-        summary_layout.addWidget(self.lbl_notes)
-        summary_layout.addWidget(self.lbl_bom)
-        sidebar_layout.addWidget(summary_group)
-
-        # Filters
-        filter_row = QHBoxLayout()
-        self.filter_all = QPushButton("All")
-        self.filter_dim = QPushButton("Dimensions")
-        self.filter_note = QPushButton("Notes")
-        self.filter_bom = QPushButton("BOM")
-        for b in (self.filter_all, self.filter_dim, self.filter_note, self.filter_bom):
-            b.setCheckable(True)
-        self.filter_all.setChecked(True)
-        self._filter = "all"
-        self.filter_all.clicked.connect(lambda: self._set_filter("all"))
-        self.filter_dim.clicked.connect(lambda: self._set_filter("dimension"))
-        self.filter_note.clicked.connect(lambda: self._set_filter("note"))
-        self.filter_bom.clicked.connect(lambda: self._set_filter("bom"))
-        filter_row.addWidget(self.filter_all)
-        filter_row.addWidget(self.filter_dim)
-        filter_row.addWidget(self.filter_note)
-        filter_row.addWidget(self.filter_bom)
-        sidebar_layout.addLayout(filter_row)
-
-        # Balloon list
-        balloon_list_group = QGroupBox("Balloons")
-        self.balloon_list_layout = QVBoxLayout(balloon_list_group)
-        self.balloon_list_layout.setContentsMargins(4, 4, 4, 4)
-        sidebar_layout.addWidget(balloon_list_group)
-
-        # Scroll for sidebar
-        scroll = QScrollArea()
-        scroll.setWidget(sidebar)
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-
+        # Content splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.view)
-        splitter.addWidget(scroll)
-        splitter.setSizes([700, 380])
-        self.setCentralWidget(splitter)
 
-        # Toolbar
-        tb = self.addToolBar("Main")
-        self.undo_btn = QPushButton("Undo")
-        self.undo_btn.clicked.connect(self._undo)
-        self.undo_btn.setEnabled(False)
-        self.clear_btn = QPushButton("Clear All")
-        self.clear_btn.clicked.connect(self._clear_all)
-        self.clear_btn.setEnabled(False)
-        self.export_btn = QPushButton("Export JSON")
-        self.export_btn.clicked.connect(self._export)
-        self.export_btn.setEnabled(False)
-        tb.addWidget(self.undo_btn)
-        tb.addWidget(self.clear_btn)
-        tb.addWidget(self.export_btn)
+        # Wizard sidebar
+        self.wizard_panel = QStackedWidget()
+        self.wizard_panel.setFixedWidth(390)
+        self._setup_wizard_steps()
 
-        self._load_btn = QPushButton("Load image (JPG/PNG)")
-        self._load_btn.clicked.connect(self._load_image)
-        tb.addWidget(self._load_btn)
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setWidget(self.wizard_panel)
+        sidebar_scroll.setWidgetResizable(True)
+        splitter.addWidget(sidebar_scroll)
+        splitter.setSizes([820, 390])
+        main_layout.addWidget(splitter)
 
-        self._auto_btn = QPushButton("Auto-Detect")
-        self._auto_btn.clicked.connect(self._run_autodetect)
-        self._auto_btn.setEnabled(False)
-        tb.addWidget(self._auto_btn)
-
-        # Scene click
         self.view.viewport().installEventFilter(self)
+        self._update_ui_state()
 
-        self._refresh_sidebar()
+    # ---------------------------------------------------------------- wizard
+    def _setup_wizard_steps(self) -> None:
+        """Build wizard pages 0-9 (one per Phase enum value)."""
 
-    def eventFilter(self, obj, event):
-        from PyQt6.QtCore import QEvent
-        from PyQt6.QtGui import QMouseEvent
-        if obj == self.view.viewport() and event.type() == QEvent.Type.MouseButtonPress:
-            if event.button() == Qt.MouseButton.LeftButton:
-                pos = self.view.mapToScene(event.pos())
-                self._on_scene_click(pos.x(), pos.y())
-        return super().eventFilter(obj, event)
+        # ── Page 0: Upload ──────────────────────────────────────────────
+        p0 = self._create_step_widget("Step 1 · Upload Drawing", page_id=0)
+        self.btn_load = QPushButton("Select Drawing (JPG / PNG / TIFF)")
+        self.btn_load.setStyleSheet("padding: 6px; font-weight: bold;")
+        self.btn_load.clicked.connect(self._load_image)
+        self.lbl_paper_size = QLabel("Paper size: not detected")
+        self.lbl_paper_size.setStyleSheet("color: #666;")
+        p0.layout().insertWidget(1, self.btn_load)
+        p0.layout().insertWidget(2, self.lbl_paper_size)
+        self.wizard_panel.addWidget(p0)   # index 0
 
-    def _set_mode(self, mode: str):
-        state["mode"] = mode
-        state["dimension_type"] = self.dim_type.currentText()
-        state["flow_direction"] = self.flow_dir.currentText()
-        self.dim_group.setVisible(mode == "dimension")
-        self.note_group.setVisible(mode == "note")
-        self.bom_group.setVisible(mode == "bom")
+        # ── Page 1: Zone Segmentation ────────────────────────────────────
+        p1 = self._create_step_widget("Step 2 · Zone Segmentation", page_id=1)
+        self.lbl_zones = QLabel("Zones: Drawing | Notes | BOM")
+        self.lbl_zones.setWordWrap(True)
+        self.btn_run_zone = QPushButton("Run Zone Detection")
+        self.btn_run_zone.clicked.connect(self._run_zone_phase)
+        p1.layout().insertWidget(1, self.lbl_zones)
+        p1.layout().insertWidget(2, self.btn_run_zone)
+        self.wizard_panel.addWidget(p1)   # index 1
 
-    def _set_filter(self, f: str):
-        self._filter = f
-        self.filter_all.setChecked(f == "all")
-        self.filter_dim.setChecked(f == "dimension")
-        self.filter_note.setChecked(f == "note")
-        self.filter_bom.setChecked(f == "bom")
-        self._refresh_balloon_list()
+        # ── Page 2: View Detection ───────────────────────────────────────
+        p2 = self._create_step_widget("Step 3 · View Detection", page_id=2)
+        self.btn_run_views = QPushButton("Detect Orthographic Views")
+        self.btn_run_views.clicked.connect(self._run_view_phase)
+        self.view_list_container = QWidget()
+        self.view_list_layout = QVBoxLayout(self.view_list_container)
+        self.view_list_layout.setContentsMargins(0, 0, 0, 0)
+        p2.layout().insertWidget(1, self.btn_run_views)
+        p2.layout().insertWidget(2, self.view_list_container)
+        self.wizard_panel.addWidget(p2)   # index 2
 
-    def _add_view(self):
-        name = self.view_name.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Validation", "Please enter a view name.")
-            return
-        add_view(name, self.view_type.currentText())
-        self.view_name.clear()
-        self._refresh_view_list()
-        self._refresh_sidebar()
+        # ── Page 3: View Confirmation (NEW) ──────────────────────────────
+        p3 = self._create_step_widget("Step 4 · Confirm Views", page_id=3)
+        lbl_hint = QLabel(
+            "Review auto-detected views below.\n"
+            "Edit labels or remove incorrect entries, then click Confirm."
+        )
+        lbl_hint.setWordWrap(True)
+        lbl_hint.setStyleSheet("color: #444;")
+        self.btn_confirm_views = QPushButton("✔  Confirm All Views")
+        self.btn_confirm_views.setStyleSheet(
+            "QPushButton { background:#27ae60; color:white; font-weight:bold; padding:7px; }"
+            "QPushButton:hover { background:#2ecc71; }"
+        )
+        self.btn_confirm_views.clicked.connect(self._confirm_views)
+        self.view_confirm_container = QWidget()
+        self.view_confirm_layout = QVBoxLayout(self.view_confirm_container)
+        self.view_confirm_layout.setContentsMargins(0, 4, 0, 0)
+        p3.layout().insertWidget(1, lbl_hint)
+        p3.layout().insertWidget(2, self.btn_confirm_views)
+        p3.layout().insertWidget(3, self.view_confirm_container)
+        self.wizard_panel.addWidget(p3)   # index 3
 
-    def _load_image(self):
+        # ── Page 4: Flow Direction ───────────────────────────────────────
+        p4 = self._create_step_widget("Step 5 · Flow Direction", page_id=4)
+        flow_group = QGroupBox("Balloon Sequence Direction")
+        flow_layout = QVBoxLayout(flow_group)
+        self.rb_cw  = QRadioButton("Clockwise (CW)")
+        self.rb_acw = QRadioButton("Anti-Clockwise (ACW)")
+        self.rb_cw.setChecked(True)
+        self.rb_cw.toggled.connect(lambda chk: setattr(state, "flow_direction", "CW") if chk else None)
+        self.rb_acw.toggled.connect(lambda chk: setattr(state, "flow_direction", "ACW") if chk else None)
+        flow_layout.addWidget(self.rb_cw)
+        flow_layout.addWidget(self.rb_acw)
+        p4.layout().insertWidget(1, flow_group)
+        self.wizard_panel.addWidget(p4)   # index 4
+
+        # ── Page 5: Run Detection ────────────────────────────────────────
+        p5 = self._create_step_widget("Step 6 · Auto-Balloon", page_id=5)
+        self.btn_detect = QPushButton("Run Auto-Ballooning")
+        self.btn_detect.setStyleSheet(
+            "QPushButton { background:#2980b9; color:white; font-weight:bold; padding:8px; }"
+            "QPushButton:hover { background:#3498db; }"
+        )
+        self.btn_detect.clicked.connect(self._run_detection)
+        p5.layout().insertWidget(1, self.btn_detect)
+        self.wizard_panel.addWidget(p5)   # index 5
+
+        # ── Pages 6-7: Notes / BOM placeholders ──────────────────────────
+        self.wizard_panel.addWidget(
+            self._create_step_widget("Step 7 · Notes Detection", page_id=6)
+        )   # index 6
+        self.wizard_panel.addWidget(
+            self._create_step_widget("Step 8 · BOM Detection", page_id=7)
+        )   # index 7
+
+        # ── Page 8: Review & Override ────────────────────────────────────
+        p8 = self._create_step_widget("Step 9 · Review & Override", page_id=8)
+        self.lbl_summary = QLabel("Summary: 0 High · 0 Med · 0 Low confidence")
+        self.lbl_summary.setWordWrap(True)
+        self.balloon_list_container = QWidget()
+        self.balloon_list_layout = QVBoxLayout(self.balloon_list_container)
+        self.balloon_list_layout.setContentsMargins(0, 0, 0, 0)
+        p8.layout().insertWidget(1, self.lbl_summary)
+        p8.layout().insertWidget(2, self.balloon_list_container)
+        self.wizard_panel.addWidget(p8)   # index 8
+
+        # ── Page 9: Export ───────────────────────────────────────────────
+        p9 = self._create_step_widget("Step 10 · Export Report", page_id=9)
+        self.btn_export_all  = QPushButton("Export All (PDF + JSON + Image)")
+        self.btn_export_json = QPushButton("Export JSON only")
+        self.btn_export_img  = QPushButton("Export Annotated Image")
+        self.btn_export_pdf  = QPushButton("Generate PDF Report")
+        self.btn_export_all.setStyleSheet(
+            "QPushButton { background:#e67e22; color:white; font-weight:bold; padding:8px; }"
+        )
+        self.btn_export_all.clicked.connect(self._export_all)
+        self.btn_export_json.clicked.connect(self._export_json)
+        self.btn_export_img.clicked.connect(self._export_image)
+        self.btn_export_pdf.clicked.connect(self._export_pdf)
+        for btn in (self.btn_export_all, self.btn_export_json,
+                    self.btn_export_img, self.btn_export_pdf):
+            p9.layout().insertWidget(p9.layout().count() - 2, btn)
+        self.wizard_panel.addWidget(p9)   # index 9
+
+    def _create_step_widget(self, title: str, page_id: int) -> QWidget:
+        """Generic wizard page with title + Back/Next navigation."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(8)
+
+        lbl = QLabel(title)
+        lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #2c3e50; padding: 4px 0;")
+        layout.addWidget(lbl)
+
+        layout.addStretch()
+
+        nav = QHBoxLayout()
+        btn_back = QPushButton("◀  Back")
+        btn_next = QPushButton("Next  ▶")
+        btn_back.setFixedHeight(30)
+        btn_next.setFixedHeight(30)
+        btn_back.clicked.connect(self._on_back)
+        btn_next.clicked.connect(self._on_next)
+        nav.addWidget(btn_back)
+        nav.addWidget(btn_next)
+        layout.addLayout(nav)
+
+        widget.setProperty("btn_next", btn_next)
+        widget.setProperty("btn_back", btn_back)
+        return widget
+
+    # --------------------------------------------------------- UI sync
+    def _update_ui_state(self) -> None:
+        """Sync wizard page, progress bar, and button states to state.current_phase."""
+        phase_val = state.current_phase.value
+        page_idx  = min(phase_val, self.wizard_panel.count() - 1)
+        self.wizard_panel.setCurrentIndex(page_idx)
+        self.progress_bar.setValue(phase_val)
+
+        current_widget = self.wizard_panel.currentWidget()
+        btn_back = current_widget.property("btn_back")
+        btn_next = current_widget.property("btn_next")
+
+        if btn_back:
+            btn_back.setEnabled(phase_val > 0)
+
+        # Ask the state's gate whether we can advance
+        can_proceed = True
+        next_val = phase_val + 1
+        if next_val <= 9:
+            try:
+                next_phase = Phase(next_val)
+                can_proceed, _ = state.can_advance_to(next_phase)
+            except ValueError:
+                can_proceed = True
+
+        if btn_next:
+            btn_next.setEnabled(can_proceed)
+
+        # Refresh phase-specific sub-panels
+        if phase_val == 2:    # VIEW_DETECT
+            self._refresh_view_list()
+        elif phase_val == 3:  # VIEW_CONFIRM
+            self._refresh_view_confirm_list()
+        elif phase_val == 8:  # MANUAL_OVERRIDE
+            self._refresh_balloon_list()
+
+    # --------------------------------------------------------- Navigation
+    def _on_next(self) -> None:
+        if advance_phase():
+            self._update_ui_state()
+
+    def _on_back(self) -> None:
+        idx = PHASES.index(state.current_phase) - 1
+        if idx >= 0 and go_back_to_phase(idx):
+            self._update_ui_state()
+
+    # --------------------------------------------------------- Phase 0: Load image
+    def _load_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open drawing", "", "Images (JPG, PNG) (*.jpg *.jpeg *.png)"
+            self, "Open Engineering Drawing", "",
+            "Images (*.jpg *.jpeg *.png *.tif *.tiff *.bmp)"
         )
         if not path:
             return
+
         pixmap = QPixmap(path)
         if pixmap.isNull():
-            QMessageBox.critical(self, "Error", "Could not load image.")
+            QMessageBox.critical(self, "Error", f"Cannot load image:\n{path}")
             return
-        w, h = pixmap.width(), pixmap.height()
-        state["image_width"] = w
-        state["image_height"] = h
-        scale = min(1.0, MAX_IMAGE_WIDTH / w)
-        state["scale"] = scale
-        scaled = pixmap.scaled(int(w * scale), int(h * scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        state["scene_width"] = scaled.width()
-        state["scene_height"] = scaled.height()
-        state["image_data"] = scaled
+
+        state["image_data"]  = pixmap
         state["image_loaded"] = True
-        state["balloons"] = []
-        state["next_balloon_number"] = 1
-        state["undo_stack"] = []
-        self.scene.set_image(scaled)
-        self.undo_btn.setEnabled(False)
-        self.clear_btn.setEnabled(True)
-        self.export_btn.setEnabled(True)
-        self._auto_btn.setEnabled(True)
-        self._refresh_sidebar()
+        state.cv_image = qpixmap_to_cv(pixmap)
 
-    def _run_autodetect(self):
-        if not state["image_loaded"]:
-             return
-            
-        if QMessageBox.question(
-            self, "Auto-Detect",
-            "This will clear existing balloons and replace them with auto-detected ones. Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        ) != QMessageBox.StandardButton.Yes:
-            return
-            
-        self._push_undo()
-        
-        # Get flow direction from UI or state
-        flow = self.flow_dir.currentText()
-        
-        try:
-            balloons, views = autodetect_run(state["image_data"], flow_direction=flow)
-            
-            if not balloons:
-                QMessageBox.information(self, "Auto-Detect", "No features detected.")
-                return
-                
-            state["balloons"] = balloons
-            # Replace views for auto mode
-            state["views"] = views
-            state["next_balloon_number"] = len(balloons) + 1
-            
-            # Select first view if available
-            if state["views"]:
-                state["selected_view_id"] = state["views"][0]["id"]
-            else:
-                state["selected_view_id"] = None
-            
-            self.scene.sync_balloons()
-            self._refresh_sidebar()
-            QMessageBox.information(self, "Auto-Detect", f"Detected {len(state['views'])} views and {len(balloons)} balloons.")
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Auto-Detect Error", str(e))
+        meta_name = Path(path).stem
+        state["drawing_meta"]["name"] = meta_name
+        self.scene.set_image(pixmap)
 
-    def _on_scene_click(self, x: float, y: float):
-        if not state["image_loaded"]:
-            QMessageBox.warning(self, "Annotation", "Please load an image first.")
-            return
-        if state["selected_view_id"] is None:
-            QMessageBox.warning(self, "Annotation", "Please create and select a view first.")
-            return
-        mode = state["mode"]
-        if mode == "dimension":
-            pass  # no required fields
-        elif mode == "note":
-            if not self.note_text.toPlainText().strip():
-                QMessageBox.warning(self, "Validation", "Note text cannot be empty.")
-                return
-        elif mode == "bom":
-            if not self.bom_item.text().strip() or not self.bom_desc.text().strip() or not self.bom_qty.text().strip():
-                QMessageBox.warning(self, "Validation", "Item number, description and quantity are required for BOM.")
-                return
+        # Quick paper-size hint from pixel dimensions
+        h, w = state.cv_image.shape[:2]
+        ratio = max(w, h) / min(w, h)
+        hint = "A4" if abs(ratio - 1.414) < 0.15 else "Custom"
+        self.lbl_paper_size.setText(f"Detected size: {hint}  ({w} × {h} px)")
 
-        # Bounds check
-        if x < 0 or y < 0 or x > state["scene_width"] or y > state["scene_height"]:
+        self._set_status("Image loaded. Click 'Next' to proceed to zone detection.")
+        self._update_ui_state()
+
+    # --------------------------------------------------------- Phase 1: Zone detection
+    def _run_zone_phase(self) -> None:
+        if state.cv_image is None:
+            QMessageBox.warning(self, "Warning", "Please load a drawing image first.")
             return
 
-        self._push_undo()
-        balloon = {
-            "id": generate_id(),
-            "number": state["next_balloon_number"],
-            "type": mode,
-            "x": x,
-            "y": y,
-            "viewId": state["selected_view_id"],
-        }
-        state["next_balloon_number"] += 1
-        if mode == "dimension":
-            balloon["dimensionType"] = self.dim_type.currentText()
-            balloon["flowDirection"] = self.flow_dir.currentText()
-            balloon["value"] = self.dim_value.text().strip()
-        elif mode == "note":
-            balloon["text"] = self.note_text.toPlainText().strip()
-        elif mode == "bom":
-            balloon["itemNumber"] = self.bom_item.text().strip()
-            balloon["description"] = self.bom_desc.text().strip()
-            balloon["quantity"] = self.bom_qty.text().strip()
-            balloon["material"] = self.bom_material.text().strip()
-            balloon["notes"] = self.bom_notes.text().strip()
-        state["balloons"].append(balloon)
+        self.btn_run_zone.setEnabled(False)
+        self._set_status("Running preprocessing + zone detection…")
+
+        self._preproc_worker = PreprocessingWorker()
+        self._preproc_worker.progress.connect(self._on_worker_progress)
+        self._preproc_worker.finished.connect(self._on_preprocessing_done)
+        self._preproc_worker.error.connect(self._on_worker_error)
+        self._preproc_worker.start()
+
+    @pyqtSlot(np.ndarray)
+    def _on_preprocessing_done(self, gray_img: np.ndarray) -> None:
+        # Convert numpy → pixmap in main thread (Qt-safe)
+        pixmap = _gray_ndarray_to_pixmap(gray_img)
+        self.scene.set_image(pixmap)
+
+        zones = state.zones
+        found = [k for k, v in zones.items() if v]
+        self.lbl_zones.setText(f"Zones found: {', '.join(found)}")
+
+        # Build view_boundaries for visual overlay
+        boundaries = []
+        for zname, bbox in zones.items():
+            if bbox:
+                x, y, w, h = bbox
+                boundaries.append({
+                    "id": zname, "name": zname.upper(),
+                    "type": "ZONE", "x": x, "y": y, "w": w, "h": h,
+                })
+        state["view_boundaries"] = boundaries
         self.scene.sync_balloons()
-        self._clear_form()
-        self._refresh_sidebar()
 
-    def _push_undo(self):
-        state["undo_stack"].append([b.copy() for b in state["balloons"]])
-        if len(state["undo_stack"]) > 50:
-            state["undo_stack"].pop(0)
-        self.undo_btn.setEnabled(True)
+        self.btn_run_zone.setEnabled(True)
+        self._set_status(f"Zones detected: {', '.join(found)}. Click 'Next'.")
+        self._update_ui_state()
 
-    def _undo(self):
-        if not state["undo_stack"]:
+    # --------------------------------------------------------- Phase 2: View detection
+    def _run_view_phase(self) -> None:
+        if not state.zones:
+            QMessageBox.warning(self, "Error", "Run zone detection first.")
             return
-        state["balloons"] = state["undo_stack"].pop()
-        state["next_balloon_number"] = len(state["balloons"]) + 1
+
+        self.btn_run_views.setEnabled(False)
+        self._set_status("Detecting orthographic views…")
+
+        self._view_worker = ViewDetectionWorker()
+        self._view_worker.progress.connect(self._on_worker_progress)
+        self._view_worker.finished.connect(self._on_view_detection_done)
+        self._view_worker.error.connect(self._on_worker_error)
+        self._view_worker.start()
+
+    @pyqtSlot()
+    def _on_view_detection_done(self) -> None:
+        views = state.detected_views
+
+        # Update view_boundaries overlay
+        boundaries = [b for b in state.get("view_boundaries", [])
+                      if b.get("type") == "ZONE"]
+        for v in views:
+            vx, vy, vw, vh = v.bbox
+            boundaries.append({
+                "id": str(v.view_id), "name": v.label,
+                "type": "VIEW", "x": vx, "y": vy, "w": vw, "h": vh,
+            })
+        state["view_boundaries"] = boundaries
         self.scene.sync_balloons()
-        self.undo_btn.setEnabled(len(state["undo_stack"]) > 0)
-        self._refresh_sidebar()
 
-    def _clear_all(self):
-        if QMessageBox.question(
-            self, "Clear all",
-            "Clear all balloons? This cannot be undone.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        self._push_undo()
-        state["balloons"] = []
-        state["next_balloon_number"] = 1
-        self.scene.sync_balloons()
-        self._refresh_sidebar()
-
-    def _delete_balloon(self, balloon_id: str):
-        if QMessageBox.question(
-            self, "Delete balloon",
-            "Delete this balloon? All subsequent balloons will be renumbered.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        self._push_undo()
-        state["balloons"] = [b for b in state["balloons"] if b["id"] != balloon_id]
-        renumber_all_balloons()
-        self.scene.sync_balloons()
-        self._refresh_sidebar()
-
-    def _edit_balloon(self, balloon_id: str):
-        b = next((x for x in state["balloons"] if x["id"] == balloon_id), None)
-        if not b:
-            return
-        self._set_mode(b["type"])
-        state["selected_view_id"] = b.get("viewId")
         self._refresh_view_list()
-        if b["type"] == "dimension":
-            self.dim_type.setCurrentText(b.get("dimensionType", "linear"))
-            self.flow_dir.setCurrentText(b.get("flowDirection", "clockwise"))
-            self.dim_value.setText(b.get("value", ""))
-        elif b["type"] == "note":
-            self.note_text.setPlainText(b.get("text", ""))
-        elif b["type"] == "bom":
-            self.bom_item.setText(b.get("itemNumber", ""))
-            self.bom_desc.setText(b.get("description", ""))
-            self.bom_qty.setText(b.get("quantity", ""))
-            self.bom_material.setText(b.get("material", ""))
-            self.bom_notes.setText(b.get("notes", ""))
-        self._push_undo()
-        state["balloons"] = [x for x in state["balloons"] if x["id"] != balloon_id]
-        renumber_all_balloons()
-        self.scene.sync_balloons()
-        self._refresh_sidebar()
-        QMessageBox.information(self, "Edit", "Balloon removed. Click on the canvas to place it again with the current values.")
+        self.btn_run_views.setEnabled(True)
+        self._set_status(f"{len(views)} view(s) detected. Review on the next page.")
+        self._update_ui_state()
 
-    def _clear_form(self):
-        self.dim_value.clear()
-        self.note_text.clear()
-        self.bom_item.clear()
-        self.bom_desc.clear()
-        self.bom_qty.clear()
-        self.bom_material.clear()
-        self.bom_notes.clear()
-
-    def _refresh_view_list(self):
+    def _refresh_view_list(self) -> None:
+        """Populate the detected-view summary on page 2."""
         while self.view_list_layout.count():
-            child = self.view_list_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-        for v in state["views"]:
-            count = get_balloon_count_for_view(v["id"])
-            row = QHBoxLayout()
-            lbl = QLabel(f"{v['name']} ({v['type']}) — {count}")
-            lbl.setStyleSheet("font-weight: bold;" if v["id"] == state["selected_view_id"] else "")
-            btn = QPushButton("Del")
-            btn.setFixedWidth(40)
-            vid = v["id"]
-            btn.clicked.connect(lambda checked, id=vid: self._delete_view(id))
-            sel_btn = QPushButton("Select")
-            sel_btn.clicked.connect(lambda checked, id=vid: self._select_view(id))
-            row.addWidget(lbl, 1)
-            row.addWidget(sel_btn)
-            row.addWidget(btn)
-            w = QWidget()
-            w.setLayout(row)
-            self.view_list_layout.addWidget(w)
+            item = self.view_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for v in state.detected_views:
+            lbl = QLabel(
+                f"• <b>{v.label}</b> "
+                f"<span style='color:#888;'>(conf {v.confidence:.0%}, "
+                f"src: {v.label_source})</span>"
+            )
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            self.view_list_layout.addWidget(lbl)
 
-    def _delete_view(self, view_id: int):
-        if QMessageBox.question(
-            self, "Delete view",
-            "Delete this view? Balloons in this view will not be deleted.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        remove_view(view_id)
-        self._refresh_view_list()
-        self._refresh_balloon_list()
+    # --------------------------------------------------------- Phase 3: View confirmation
+    def _refresh_view_confirm_list(self) -> None:
+        """Populate the editable view list on the confirmation page."""
+        while self.view_confirm_layout.count():
+            item = self.view_confirm_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
-    def _select_view(self, view_id: int):
-        state["selected_view_id"] = view_id
-        self._refresh_view_list()
-        self._refresh_sidebar()
+        for v in state.detected_views:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 2, 0, 2)
 
-    def _refresh_balloon_list(self):
-        while self.balloon_list_layout.count():
-            child = self.balloon_list_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-        balloons = state["balloons"]
-        if self._filter != "all":
-            balloons = [b for b in balloons if b.get("type") == self._filter]
-        balloons = sorted(balloons, key=lambda b: b["number"])
-        for b in balloons:
-            row = QHBoxLayout()
-            t = b.get("type", "")
-            if t == "dimension":
-                detail = f"{b.get('dimensionType', '')} — {b.get('value', '')}"
-            elif t == "note":
-                detail = (b.get("text", "") or "")[:40]
-            else:
-                detail = f"#{b.get('itemNumber','')} {b.get('description','')} x{b.get('quantity','')}"
-            lbl = QLabel(f"#{b['number']} [{t}] {detail}")
-            lbl.setWordWrap(True)
-            row.addWidget(lbl, 1)
-            del_btn = QPushButton("Del")
-            del_btn.setFixedWidth(40)
-            bid = b["id"]
-            del_btn.clicked.connect(lambda checked, id=bid: self._delete_balloon(id))
-            edit_btn = QPushButton("Edit")
-            edit_btn.clicked.connect(lambda checked, id=bid: self._edit_balloon(id))
-            row.addWidget(edit_btn)
-            row.addWidget(del_btn)
-            w = QWidget()
-            w.setLayout(row)
-            self.balloon_list_layout.addWidget(w)
+            lbl = QLabel(f"<b>{v.label}</b> ({v.confidence:.0%})")
+            lbl.setTextFormat(Qt.TextFormat.RichText)
 
-    def _refresh_sidebar(self):
-        self._refresh_view_list()
-        self._refresh_balloon_list()
-        n = len(state["balloons"])
-        self.lbl_total.setText(f"Total: {n}")
-        self.lbl_dims.setText(f"Dimensions: {sum(1 for b in state['balloons'] if b.get('type') == 'dimension')}")
-        self.lbl_notes.setText(f"Notes: {sum(1 for b in state['balloons'] if b.get('type') == 'note')}")
-        self.lbl_bom.setText(f"BOM: {sum(1 for b in state['balloons'] if b.get('type') == 'bom')}")
+            btn_edit = QPushButton("Edit")
+            btn_edit.setFixedWidth(44)
+            btn_edit.clicked.connect(lambda _, view=v: self._edit_view_label(view))
 
-    def _export(self):
-        if not state["balloons"]:
-            QMessageBox.warning(self, "Export", "No balloons to export.")
-            return
-        ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-        default_name = f"drawing-annotation-{ts}.json"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export JSON", default_name, "JSON (*.json)"
+            btn_del = QPushButton("✕")
+            btn_del.setFixedWidth(28)
+            btn_del.setStyleSheet("color: red;")
+            btn_del.clicked.connect(lambda _, view=v: self._delete_view(view))
+
+            row_layout.addWidget(lbl, stretch=1)
+            row_layout.addWidget(btn_edit)
+            row_layout.addWidget(btn_del)
+            self.view_confirm_layout.addWidget(row)
+
+    def _edit_view_label(self, view) -> None:
+        new_label, ok = QInputDialog.getText(
+            self, "Edit View Label", "Label:", text=view.label
         )
-        if not path:
+        if ok and new_label.strip():
+            view.label = new_label.strip().upper()
+            view.is_manually_edited = True
+            self._refresh_view_confirm_list()
+
+    def _delete_view(self, view) -> None:
+        state.detected_views = [v for v in state.detected_views if v.view_id != view.view_id]
+        # Also remove overlay boundary
+        state["view_boundaries"] = [
+            b for b in state.get("view_boundaries", [])
+            if str(b.get("id")) != str(view.view_id)
+        ]
+        self.scene.sync_balloons()
+        self._refresh_view_confirm_list()
+
+    def _confirm_views(self) -> None:
+        if not state.detected_views:
+            QMessageBox.warning(self, "No views", "No views to confirm.")
+            return
+        for v in state.detected_views:
+            v.is_confirmed = True
+        state.views_confirmed = True
+        self._set_status(f"{len(state.detected_views)} view(s) confirmed. Select flow direction.")
+        self._update_ui_state()
+
+    # --------------------------------------------------------- Phase 4: Flow direction
+    # (set in _run_detection below)
+
+    # --------------------------------------------------------- Phase 5: Dimension extraction
+    def _run_detection(self) -> None:
+        if not state.views_confirmed:
+            QMessageBox.warning(
+                self, "Views not confirmed",
+                "Please confirm the detected views on the previous step."
+            )
+            return
+
+        self.btn_detect.setEnabled(False)
+        self._set_status(f"Running auto-ballooning ({state.flow_direction})…")
+
+        self._dim_worker = DimensionExtractionWorker()
+        self._dim_worker.progress.connect(self._on_worker_progress)
+        self._dim_worker.finished.connect(self._on_detection_done)
+        self._dim_worker.error.connect(self._on_worker_error)
+        self._dim_worker.start()
+
+    @pyqtSlot()
+    def _on_detection_done(self) -> None:
+        balloons = state.balloons
+
+        # Confidence summary
+        def _conf(b):
+            from state import Balloon as BDC
+            return b.confidence if isinstance(b, BDC) else b.get("confidence", 0)
+
+        hi = sum(1 for b in balloons if _conf(b) > 80)
+        md = sum(1 for b in balloons if 50 <= _conf(b) <= 80)
+        lo = sum(1 for b in balloons if _conf(b) < 50)
+        self.lbl_summary.setText(
+            f"Total: {len(balloons)} — High: {hi} · Med: {md} · Low: {lo}"
+        )
+
+        self.scene.sync_balloons()
+        self.btn_detect.setEnabled(True)
+        self._set_status(f"Detection complete — {len(balloons)} balloon(s). Review in Step 9.")
+        self._update_ui_state()
+
+    # --------------------------------------------------------- Phase 8: Review & balloon list
+    def _refresh_balloon_list(self) -> None:
+        while self.balloon_list_layout.count():
+            item = self.balloon_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for b in state.balloons:
+            num = _balloon_number(b)
+            val = _balloon_value(b)
+            btn = QPushButton(f"#{num}  —  {val}")
+            btn.setStyleSheet("text-align:left; padding: 3px 6px;")
+            btn.clicked.connect(lambda _, bd=b: self._focus_balloon(bd))
+            self.balloon_list_layout.addWidget(btn)
+
+    def _focus_balloon(self, b) -> None:
+        x, y = _balloon_xy(b)
+        self.view.centerOn(float(x), float(y))
+
+    def _show_balloon_context_menu(self, balloon_data: dict, screen_pos) -> None:
+        menu = QMenu(self)
+        edit_action   = QAction("Edit Value",        self)
+        delete_action = QAction("Delete Balloon",    self)
+        flag_action   = QAction("Toggle Flag",       self)
+
+        edit_action.triggered.connect(lambda: self._edit_balloon(balloon_data))
+        delete_action.triggered.connect(lambda: self._delete_balloon(balloon_data))
+        flag_action.triggered.connect(lambda: self._flag_balloon(balloon_data))
+
+        menu.addAction(edit_action)
+        menu.addAction(delete_action)
+        menu.addAction(flag_action)
+        menu.exec(screen_pos)
+
+    def _edit_balloon(self, b) -> None:
+        from state import Balloon as BDC
+        current = b.value if isinstance(b, BDC) else b.get("value", "")
+        new_val, ok = QInputDialog.getText(
+            self, "Edit Value", "Value:", QLineEdit.EchoMode.Normal, current
+        )
+        if ok:
+            if isinstance(b, BDC):
+                b.value = new_val
+            else:
+                b["value"] = new_val
+            self.scene.sync_balloons()
+            self._refresh_balloon_list()
+
+    def _delete_balloon(self, b) -> None:
+        bid = _balloon_id(b)
+        state.balloons = [
+            x for x in state.balloons if _balloon_id(x) != bid
+        ]
+        renumber_all_balloons()
+        self.scene.sync_balloons()
+        self._refresh_balloon_list()
+
+    def _flag_balloon(self, b) -> None:
+        from state import Balloon as BDC
+        if isinstance(b, BDC):
+            b.is_flagged = not b.is_flagged
+        else:
+            b["flagged"] = not b.get("flagged", False)
+        self.scene.sync_balloons()
+
+    # --------------------------------------------------------- Phase 9: Export
+    def _export_all(self) -> None:
+        output_dir = QFileDialog.getExistingDirectory(
+            self, "Select Output Folder", str(Path.home() / "Documents")
+        )
+        if not output_dir:
             return
         try:
-            export_to_file(path)
-            QMessageBox.information(self, "Export", "Export completed successfully.")
+            paths = export_all(state, output_dir)
+            QMessageBox.information(
+                self, "Export Complete",
+                "Exported:\n" + "\n".join(paths.values())
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Export", f"Export failed: {e}")
+            QMessageBox.critical(self, "Export Error", str(e))
+
+    def _export_json(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export JSON", "drawing.json", "JSON (*.json)"
+        )
+        if path:
+            try:
+                export_json(state, path)
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", str(e))
+
+    def _export_image(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Image", "drawing_annotated.png", "PNG (*.png)"
+        )
+        if path:
+            try:
+                export_annotated_image(state, path)
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", str(e))
+
+    def _export_pdf(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export PDF Report", "ctq_report.pdf", "PDF (*.pdf)"
+        )
+        if path:
+            try:
+                img_path = path.replace(".pdf", "_annotated.png")
+                export_annotated_image(state, img_path)
+                export_pdf_report(state, img_path, path)
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", str(e))
+
+    # --------------------------------------------------------- Manual balloon add
+    def eventFilter(self, obj, event) -> bool:
+        from PyQt6.QtCore import QEvent
+        if (obj == self.view.viewport()
+                and event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton):
+            if state.current_phase.value == 8:   # MANUAL_OVERRIDE
+                pos = self.view.mapToScene(event.pos())
+                if not self.scene.itemAt(pos, self.view.transform()):
+                    self._on_manual_add(pos.x(), pos.y())
+        return super().eventFilter(obj, event)
+
+    def _on_manual_add(self, x: float, y: float) -> None:
+        b = {
+            "id":     generate_id(),
+            "number": state.next_balloon_number,
+            "type":   "dimension",
+            "x": x, "y": y,
+            "manual": True,
+            "value":  "Manual",
+        }
+        state.balloons.append(b)
+        state.next_balloon_number += 1
+        self.scene.sync_balloons()
+        self._refresh_balloon_list()
+
+    # --------------------------------------------------------- Worker shared slots
+    @pyqtSlot(int, str)
+    def _on_worker_progress(self, pct: int, msg: str) -> None:
+        self.progress_bar.setValue(pct)
+        self._set_status(msg)
+
+    @pyqtSlot(str)
+    def _on_worker_error(self, msg: str) -> None:
+        logger.error("Worker error: %s", msg)
+        QMessageBox.critical(self, "Processing Error", f"An error occurred:\n\n{msg}")
+        self.btn_run_zone.setEnabled(True)
+        self.btn_run_views.setEnabled(True)
+        self.btn_detect.setEnabled(True)
+        self._set_status("Error — see message above.")
+
+    def _set_status(self, msg: str) -> None:
+        self.status_label.setText(msg)
+
+    # --------------------------------------------------------- Cleanup
+    def _stop_worker(self, worker) -> None:
+        if worker is not None and worker.isRunning():
+            worker.quit()
+            worker.wait(3000)
+
+    def closeEvent(self, event) -> None:
+        self._stop_worker(self._preproc_worker)
+        self._stop_worker(self._view_worker)
+        self._stop_worker(self._dim_worker)
+        event.accept()

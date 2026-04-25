@@ -1,0 +1,102 @@
+{
+  "schema_version": "2.0",
+  "export_timestamp": "2026-04-25T14:10:28.690335",
+  "drawing_meta": {
+    "paper_size": "A4",
+    "flow_direction": "CW",
+    "total_balloons": 3,
+    "views_count": 3,
+    "confidence_summary": {
+      "high": 0,
+      "medium": 3,
+      "low": 0
+    }
+  },
+  "views": [
+    {
+      "view_id": 1,
+      "label": "FRONT VIEW",
+      "bbox": [
+        271,
+        7,
+        125,
+        113
+      ],
+      "confidence": 0.5,
+      "dimensions": [
+        {
+          "balloon_id": "fa30a72d-3000-4956-b4a5-0c9fb32f0b14",
+          "sequence": 1,
+          "dim_type": "linear_h",
+          "value": "—",
+          "tolerance": "",
+          "unit": "mm",
+          "confidence": 60,
+          "position": {
+            "image_x": 312,
+            "image_y": 86
+          },
+          "is_flagged": false,
+          "is_manual": false
+        },
+        {
+          "balloon_id": "7f954246-91c0-4b57-8504-1e676ef2a06e",
+          "sequence": 2,
+          "dim_type": "linear_v",
+          "value": "—",
+          "tolerance": "",
+          "unit": "mm",
+          "confidence": 60,
+          "position": {
+            "image_x": 304,
+            "image_y": 57
+          },
+          "is_flagged": false,
+          "is_manual": false
+        }
+      ]
+    },
+    {
+      "view_id": 2,
+      "label": "TOP VIEW",
+      "bbox": [
+        217,
+        336,
+        112,
+        110
+      ],
+      "confidence": 0.5,
+      "dimensions": [
+        {
+          "balloon_id": "fe6b7b31-6a22-4334-bb24-33f62bb81efe",
+          "sequence": 3,
+          "dim_type": "linear_v",
+          "value": "—",
+          "tolerance": "",
+          "unit": "mm",
+          "confidence": 53,
+          "position": {
+            "image_x": 317,
+            "image_y": 384
+          },
+          "is_flagged": false,
+          "is_manual": false
+        }
+      ]
+    },
+    {
+      "view_id": 3,
+      "label": "RIGHT SIDE VIEW",
+      "bbox": [
+        349,
+        332,
+        47,
+        145
+      ],
+      "confidence": 0.5,
+      "dimensions": []
+    }
+  ],
+  "notes": [],
+  "bom": []
+}
